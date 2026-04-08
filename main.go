@@ -57,6 +57,39 @@ type DNSRecord struct {
 	TTL      int    `json:"ttl,omitempty"`
 }
 
+// godaddyAPIError represents a structured error response from the GoDaddy API.
+// GoDaddy returns this shape for 4xx responses including 422 INVALID_BODY.
+type godaddyAPIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Fields  []struct {
+		Path    string `json:"path"`
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"fields"`
+}
+
+func (e *godaddyAPIError) Error() string {
+	if len(e.Fields) > 0 {
+		return fmt.Sprintf("%s: %s (field %q: %s)", e.Code, e.Message, e.Fields[0].Path, e.Fields[0].Message)
+	}
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
+// parseGoDaddyError reads a response body and returns a structured
+// godaddyAPIError if the body is a valid GoDaddy error envelope, or nil.
+func parseGoDaddyError(body []byte) *godaddyAPIError {
+	var apiErr godaddyAPIError
+	if json.Unmarshal(body, &apiErr) == nil && apiErr.Code != "" {
+		return &apiErr
+	}
+	return nil
+}
+
+// godaddyMinTTL is the minimum TTL accepted by the GoDaddy API.
+// Values below this return 422 UNKNOWN_RESTRICTION.
+const godaddyMinTTL = 600
+
 func main() {
 	if GroupName == "" {
 		panic("GROUP_NAME must be specified")
@@ -233,12 +266,21 @@ func (c *godaddyDNSSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return nil
 	}
 
+	// GoDaddy enforces a hard minimum TTL of 600 seconds; values below this
+	// return 422 UNKNOWN_RESTRICTION. Guard here so a misconfigured issuer
+	// (e.g. ttl omitted, defaulting to 0) doesn't cause silent failures.
+	ttl := cfg.TTL
+	if ttl < godaddyMinTTL {
+		logrus.Warnf("### Configured TTL %d is below GoDaddy minimum %d, using %d", ttl, godaddyMinTTL, godaddyMinTTL)
+		ttl = godaddyMinTTL
+	}
+
 	// Fetch existing records so concurrent challenge values for the same name
 	// are preserved. GoDaddy's PUT replaces the entire record set.
 	existing := c.getTXTRecords(cfg, dnsZone, recordName)
 	records := append(existing, DNSRecord{
 		Data: c.TXTRecordContent(ch.Key),
-		TTL:  cfg.TTL,
+		TTL:  ttl,
 		Type: "TXT",
 		Name: recordName,
 	})
@@ -420,7 +462,12 @@ func (c *godaddyDNSSolver) HasTXTRecord(cfg *godaddyDNSProviderConfig, domainZon
 			return false, nil
 		}
 	} else {
-		return false, fmt.Errorf("### Unexpected HTTP status: %d", resp.StatusCode)
+		defer resp.Body.Close()
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		if apiErr := parseGoDaddyError(bodyBytes); apiErr != nil {
+			return false, fmt.Errorf("GoDaddy API error (HTTP %d): %s", resp.StatusCode, apiErr.Error())
+		}
+		return false, fmt.Errorf("### Unexpected HTTP status: %d; Body: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	return false, nil
@@ -448,6 +495,9 @@ func (c *godaddyDNSSolver) UpdateRecords(cfg *godaddyDNSProviderConfig, records 
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		if apiErr := parseGoDaddyError(bodyBytes); apiErr != nil {
+			return fmt.Errorf("### Could not create record; GoDaddy API error (HTTP %d): %s", resp.StatusCode, apiErr.Error())
+		}
 		return fmt.Errorf("### Could not create record %v; Status: %v; Body: %s", string(body), resp.StatusCode, string(bodyBytes))
 	} else {
 		logrus.Info("### TXT record created/updated using godaddy REST API !")
