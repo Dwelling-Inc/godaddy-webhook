@@ -224,20 +224,26 @@ func (c *godaddyDNSSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	}
 
 	logrus.Infof("### Try to present the DNS record with the DNS provider using as challengeKey: %s", ch.Key)
-	_, err = c.HasTXTRecord(cfg, dnsZone, recordName, ch.Key)
+	found, err := c.HasTXTRecord(cfg, dnsZone, recordName, ch.Key)
 	if err != nil {
 		return fmt.Errorf("Unable to check the TXT record: %v", err)
 	}
+	if found {
+		logrus.Infof("### TXT record already present for challengeKey: %s, skipping update", ch.Key)
+		return nil
+	}
 
-	rec := []DNSRecord{{
+	// Fetch existing records so concurrent challenge values for the same name
+	// are preserved. GoDaddy's PUT replaces the entire record set.
+	existing := c.getTXTRecords(cfg, dnsZone, recordName)
+	records := append(existing, DNSRecord{
 		Data: c.TXTRecordContent(ch.Key),
 		TTL:  cfg.TTL,
 		Type: "TXT",
 		Name: recordName,
-	},
-	}
+	})
 
-	err = c.UpdateRecords(cfg, rec, dnsZone, recordName)
+	err = c.UpdateRecords(cfg, records, dnsZone, recordName)
 	if err != nil {
 		return fmt.Errorf("### Unable to create TXT record: %v", err)
 	}
@@ -283,16 +289,29 @@ func (c *godaddyDNSSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	}
 
 	logrus.Infof("### CleanUp should delete the relevant TXT record for the challengeKey: %s", ch.Key)
-	present, err := c.HasTXTRecord(cfg, dnsZone, recordName, ch.Key)
-	if err != nil {
-		return fmt.Errorf("### Unable to check TXT record: %s", err)
+
+	existing := c.getTXTRecords(cfg, dnsZone, recordName)
+	var remaining []DNSRecord
+	for _, r := range existing {
+		if r.Data != ch.Key {
+			remaining = append(remaining, r)
+		}
 	}
 
-	if present {
-		logrus.Infof("### Deleting entry=%s, domain=%s", recordName, dnsZone)
-		err := c.DeleteTxtRecord(cfg, dnsZone, recordName)
-		if err != nil {
+	if len(existing) == 0 || len(existing) == len(remaining) {
+		logrus.Infof("### No matching TXT record found for challengeKey: %s, nothing to clean up", ch.Key)
+		return nil
+	}
+
+	if len(remaining) == 0 {
+		logrus.Infof("### Deleting TXT record entry=%s, domain=%s", recordName, dnsZone)
+		if err := c.DeleteTxtRecord(cfg, dnsZone, recordName); err != nil {
 			return fmt.Errorf("### Unable to delete the TXT record: %v", err)
+		}
+	} else {
+		logrus.Infof("### Updating TXT record entry=%s, domain=%s (preserving %d concurrent challenge value(s))", recordName, dnsZone, len(remaining))
+		if err := c.UpdateRecords(cfg, remaining, dnsZone, recordName); err != nil {
+			return fmt.Errorf("### Unable to update TXT record after cleanup: %v", err)
 		}
 	}
 
@@ -333,6 +352,23 @@ func loadConfig(cfgJSON *apiext.JSON) (*godaddyDNSProviderConfig, error) {
 	return cfg, nil
 }
 
+// getTXTRecords returns all existing TXT records for the given name in the
+// zone. Returns an empty slice on any error (domain not found, network error,
+// etc.) so callers can safely append to the result without nil checks.
+func (c *godaddyDNSSolver) getTXTRecords(cfg *godaddyDNSProviderConfig, domainZone, recordName string) []DNSRecord {
+	url := fmt.Sprintf("/v1/domains/%s/records/TXT/%s", domainZone, recordName)
+	resp, err := c.makeRequest(cfg, http.MethodGet, url, nil)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	defer resp.Body.Close()
+	var records []DNSRecord
+	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
+		return nil
+	}
+	return records
+}
+
 func (c *godaddyDNSSolver) HasTXTRecord(cfg *godaddyDNSProviderConfig, domainZone string, recordName string, challengeKey string) (bool, error) {
 	// curl -X GET -H "Authorization: sso-key $TOKEN"
 	// "https://api.godaddy.com/v1/domains/<DOMAIN>/records/TXT/<NAME>"
@@ -348,6 +384,19 @@ func (c *godaddyDNSSolver) HasTXTRecord(cfg *godaddyDNSProviderConfig, domainZon
 	logrus.Debugf("### Godaddy HTTP body response: %s", resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
+		defer resp.Body.Close()
+		// GoDaddy returns 404 for two different situations: a record that doesn't
+		// exist (empty body or null) vs a domain that isn't in this account
+		// (body: {"code":"UNKNOWN_DOMAIN","message":"..."}). Treat them differently
+		// so cert-manager gets a clear error rather than an infinite retry loop.
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		var apiErr struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Code != "" {
+			return false, fmt.Errorf("%s: %s", apiErr.Code, apiErr.Message)
+		}
 		return false, nil
 	} else if resp.StatusCode == http.StatusOK {
 		var dnsRecords = []DNSRecord{}

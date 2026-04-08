@@ -1,0 +1,16 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag
+      - gcr.io/website-hosting-427418/godaddy-webhook:$TAG_NAME
+      - --tag
+      - gcr.io/website-hosting-427418/godaddy-webhook:latest
+      - .
+
+images:
+  - gcr.io/website-hosting-427418/godaddy-webhook:$TAG_NAME
+  - gcr.io/website-hosting-427418/godaddy-webhook:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
